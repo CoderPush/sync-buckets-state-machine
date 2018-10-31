@@ -32,6 +32,8 @@
 
 # Imports
 
+import traceback
+import sys
 import logging
 import boto3
 from threading import Thread
@@ -57,40 +59,46 @@ else:
 # Classes
 
 class ObsoleteKeyDeleter(Thread):
-    def __init__(self, job_queue=None, source=None, destination=None, region=None):
+    def __init__(self, job_queue=None, err_queue=None, source=None, destination=None, region=None):
         super(ObsoleteKeyDeleter, self).__init__()
         self.job_queue = job_queue
+        self.err_queue = err_queue
         self.source = source
         self.destination = destination
         self.s3 = boto3.client('s3', region_name=region)
 
     def run(self):
-        while not self.job_queue.empty():
-            try:
-                key = self.job_queue.get(True, 1)
-            except Empty:
-                return
+        try:
+            while not self.job_queue.empty():
+                try:
+                    key = self.job_queue.get(True, 1)
+                except Empty:
+                    return
 
-            try:
-                self.s3.head_object(Bucket=self.source, Key=key)
-                logger.info('Key: ' + key + ' is present in source bucket, nothing to do.')
-            except ClientError as e:
-                if int(e.response['Error']['Code']) == 404:  # The key was not found.
-                    logger.info('Key: ' + key + ' is not present in source bucket. Deleting orphaned key.')
-                    self.s3.delete_object(Bucket=self.destination, Key=key)
-                else:
-                    raise e
+                try:
+                    self.s3.head_object(Bucket=self.source, Key=key)
+                    logger.info('Key: ' + key + ' is present in source bucket, nothing to do.')
+                except ClientError as e:
+                    if int(e.response['Error']['Code']) == 404:  # The key was not found.
+                        logger.info('Key: ' + key + ' is not present in source bucket. Deleting orphaned key.')
+                        self.s3.delete_object(Bucket=self.destination, Key=key)
+                    else:
+                        raise e
+        except Exception as e:
+            self.err_queue.put(sys.exc_info())
 
 
 # Functions
 
 def delete_obsolete_keys(source=None, destination=None, region=None, keys=None):
     job_queue = Queue()
+    err_queue = Queue()
     worker_threads = []
 
     for i in range(THREAD_PARALLELISM):
         worker_threads.append(ObsoleteKeyDeleter(
             job_queue=job_queue,
+            err_queue=err_queue,
             source=source,
             destination=destination,
             region=region,
@@ -106,6 +114,11 @@ def delete_obsolete_keys(source=None, destination=None, region=None, keys=None):
 
     for t in worker_threads:
         t.join()
+
+    if not err_queue.empty():
+        ex_type, ex, tb = err_queue.get()
+        logger.error('\n'.join(traceback.format_exception(ex_type, ex, tb)))
+        raise ex
 
 
 def handler(event, context):

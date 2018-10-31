@@ -38,6 +38,8 @@ from threading import Thread
 from botocore.exceptions import ClientError
 from Queue import Queue, Empty
 import json
+import traceback
+import sys
 
 
 # Constants
@@ -78,9 +80,10 @@ def collect_metadata(response):
 # Classes
 
 class KeySynchronizer(Thread):
-    def __init__(self, job_queue=None, source=None, destination=None, region=None):
+    def __init__(self, job_queue=None, err_queue=None, source=None, destination=None, region=None):
         super(KeySynchronizer, self).__init__()
         self.job_queue = job_queue
+        self.err_queue = err_queue
         self.source = source
         self.destination = destination
         self.s3 = boto3.client('s3', region_name=region)
@@ -113,60 +116,65 @@ class KeySynchronizer(Thread):
         )
 
     def run(self):
-        while not self.job_queue.empty():
-            try:
-                key = self.job_queue.get(True, 1)
-            except Empty:
-                return
+        try:
+            while not self.job_queue.empty():
+                try:
+                    key = self.job_queue.get(True, 1)
+                except Empty:
+                    return
 
-            source_response = self.s3.head_object(Bucket=self.source, Key=key)
-            try:
-                destination_response = self.s3.head_object(Bucket=self.destination, Key=key)
-            except ClientError as e:
-                if int(e.response['Error']['Code']) == 404:  # 404 = we need to copy this.
-                    if 'WebsiteRedirectLocation' in source_response:
+                source_response = self.s3.head_object(Bucket=self.source, Key=key)
+                try:
+                    destination_response = self.s3.head_object(Bucket=self.destination, Key=key)
+                except ClientError as e:
+                    if int(e.response['Error']['Code']) == 404:  # 404 = we need to copy this.
+                        if 'WebsiteRedirectLocation' in source_response:
+                            self.copy_redirect(key, source_response['WebsiteRedirectLocation'])
+                        else:
+                            self.copy_object(key)
+                        continue
+                    else:  # All other return codes are unexpected.
+                        raise e
+
+                if 'WebsiteRedirectLocation' in source_response:
+                    if (
+                        source_response['WebsiteRedirectLocation'] !=
+                        destination_response.get('WebsiteRedirectLocation', None)
+                    ):
                         self.copy_redirect(key, source_response['WebsiteRedirectLocation'])
-                    else:
-                        self.copy_object(key)
                     continue
-                else:  # All other return codes are unexpected.
-                    raise e
 
-            if 'WebsiteRedirectLocation' in source_response:
-                if (
-                    source_response['WebsiteRedirectLocation'] !=
-                    destination_response.get('WebsiteRedirectLocation', None)
-                ):
-                    self.copy_redirect(key, source_response['WebsiteRedirectLocation'])
-                continue
+                source_etag = source_response.get('ETag', None)
+                destination_etag = destination_response.get('ETag', None)
+                if source_etag != destination_etag:
+                    self.copy_object(key)
+                    continue
 
-            source_etag = source_response.get('ETag', None)
-            destination_etag = destination_response.get('ETag', None)
-            if source_etag != destination_etag:
-                self.copy_object(key)
-                continue
-
-            source_metadata = collect_metadata(source_response)
-            destination_metadata = collect_metadata(destination_response)
-            if source_metadata == destination_metadata:
-                logger.info(
-                    'Key: ' + key + ' from bucket: ' + self.source +
-                    ' is already current in destination bucket: ' + self.destination
-                )
-                continue
-            else:
-                self.copy_object(key)
+                source_metadata = collect_metadata(source_response)
+                destination_metadata = collect_metadata(destination_response)
+                if source_metadata == destination_metadata:
+                    logger.info(
+                        'Key: ' + key + ' from bucket: ' + self.source +
+                        ' is already current in destination bucket: ' + self.destination
+                    )
+                    continue
+                else:
+                    self.copy_object(key)
+        except Exception as e:
+            self.err_queue.put(sys.exc_info())
 
 
 # Functions
 
 def sync_keys(source=None, destination=None, region=None, keys=None):
     job_queue = Queue()
+    err_queue = Queue()
     worker_threads = []
 
     for i in range(THREAD_PARALLELISM):
         worker_threads.append(KeySynchronizer(
             job_queue=job_queue,
+            err_queue=err_queue,
             source=source,
             destination=destination,
             region=region,
@@ -185,6 +193,11 @@ def sync_keys(source=None, destination=None, region=None, keys=None):
 
     for t in worker_threads:
         t.join()
+
+    if not err_queue.empty():
+        ex_type, ex, tb = err_queue.get()
+        logger.error('\n'.join(traceback.format_exception(ex_type, ex, tb)))
+        raise ex
 
 
 def handler(event, context):
